@@ -1,0 +1,6 @@
+{
+  "name": "Sona - Telegram Музыкальный Бот & Плеер",
+  "description": "Telegram музыкальный бот и веб-плеер в стиле Spotify: глобальный поиск треков во всех сервисах, персональные плейлисты, рекомендации, импорт из ВК и Яндекс.Музыки, офлайн-режим, шеринг и синхронизация.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
