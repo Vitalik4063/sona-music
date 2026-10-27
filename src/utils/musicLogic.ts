@@ -279,7 +279,7 @@ export function parseImportUrl(rawInput: string): ImportUrlDescriptor | null {
 
   // 5. Yandex Music: music.yandex.ru / .by / .kz / .com
   if (host.startsWith("music.yandex.")) {
-    const userPlMatch = /\/users\/([^/]+)\/playlists\/(\d+)/i.exec(pathname);
+    const userPlMatch = /\/users\/([^/]+)\/playlists\/([^/?#]+)/i.exec(pathname);
     if (userPlMatch) {
       return {
         provider: "yandex",
@@ -290,7 +290,7 @@ export function parseImportUrl(rawInput: string): ImportUrlDescriptor | null {
         queryHint: decodeURIComponent(userPlMatch[1]),
       };
     }
-    const iframePlMatch = /\/iframe\/playlist\/([^/]+)\/(\d+)/i.exec(pathname);
+    const iframePlMatch = /\/iframe\/playlist\/([^/]+)\/([^/?#]+)/i.exec(pathname);
     if (iframePlMatch) {
       return {
         provider: "yandex",

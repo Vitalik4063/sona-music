@@ -371,7 +371,15 @@ export const api = {
           id: trackId,
           title: "",
           artist: "",
+          album: null,
           duration_ms: 0,
+          artwork_url: null,
+          preview_url: null,
+          external_url: null,
+          provider: "local",
+          links: {},
+          sources: [],
+          is_demo: false,
           liked: false,
         }
       );

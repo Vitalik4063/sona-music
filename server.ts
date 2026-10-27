@@ -1,7 +1,9 @@
+import "dotenv/config";
 import express, { Request, Response } from "express";
 import http from "node:http";
 import path from "node:path";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import { createServer as createViteServer } from "vite";
@@ -12,6 +14,12 @@ import {
   scoreTrackRecommendation,
   formatDuration,
 } from "./src/utils/musicLogic";
+import {
+  fetchYandexSource,
+  fetchVkSource,
+  type ImportedTrackMetadata,
+  type ImportSource,
+} from "./src/server/providers";
 
 function decodeHtmlEntities(str: string): string {
   return String(str || "")
@@ -597,12 +605,40 @@ const playlists = new Map<number, DbPlaylist>();
 const allowedViewers: DbAllowedViewer[] = [];
 const accessRequests: DbAccessRequest[] = [];
 
-const PERSIST_FILE = "/tmp/sona_persistent_state.json";
+const DEFAULT_STATE_FILE = path.join(
+  process.env.DATA_DIR || path.join(process.cwd(), "data"),
+  "sona-state.json",
+);
+const PERSIST_FILE =
+  process.env.SONA_STATE_FILE ||
+  (process.env.VERCEL ? "/tmp/sona_persistent_state.json" : DEFAULT_STATE_FILE);
+const LEGACY_STATE_FILE = "/tmp/sona_persistent_state.json";
 
 function loadPersistedState() {
+  const sourceFile = fs.existsSync(PERSIST_FILE)
+    ? PERSIST_FILE
+    : fs.existsSync(LEGACY_STATE_FILE)
+      ? LEGACY_STATE_FILE
+      : "";
+  if (!sourceFile) return;
+
   try {
-    if (!fs.existsSync(PERSIST_FILE)) return;
-    const raw = JSON.parse(fs.readFileSync(PERSIST_FILE, "utf-8"));
+    const raw = JSON.parse(fs.readFileSync(sourceFile, "utf-8"));
+
+    if (Array.isArray(raw.users)) {
+      for (const savedUser of raw.users) {
+        const user = savedUser && Number(savedUser.id) > 0 ? savedUser : null;
+        if (!user) continue;
+        users.set(Number(user.id), {
+          ...user,
+          privacy: ["public", "selected", "private"].includes(user.privacy) ? user.privacy : "public",
+          show_liked: user.show_liked !== false,
+          show_playlists: user.show_playlists !== false,
+          share_token: String(user.share_token || `sona-${user.username || user.id}`),
+        });
+      }
+    }
+
     if (Array.isArray(raw.catalog)) {
       for (const [id, track] of raw.catalog) {
         if (track && !track.is_demo && Number(id) > 0) {
@@ -621,6 +657,9 @@ function loadPersistedState() {
     if (Array.isArray(raw.playlists)) {
       for (const [pid, pl] of raw.playlists) {
         if (pl && pl.title) {
+          pl.trackIds = Array.isArray(pl.trackIds)
+            ? Array.from(new Set(pl.trackIds.map(Number).filter((id: number) => catalog.has(id))))
+            : [];
           playlists.set(Number(pid), pl);
           if (Number(pid) >= nextPlaylistId) nextPlaylistId = Number(pid) + 1;
         }
@@ -633,8 +672,48 @@ function loadPersistedState() {
         }
       }
     }
-  } catch {
-    // ignore corrupt state
+    if (Array.isArray(raw.userPlayCounts)) {
+      for (const [uid, entries] of raw.userPlayCounts) {
+        if (!Array.isArray(entries)) continue;
+        const counts = new Map<number, number>();
+        for (const [trackId, count] of entries) {
+          if (catalog.has(Number(trackId))) counts.set(Number(trackId), Number(count) || 0);
+        }
+        userPlayCounts.set(Number(uid), counts);
+      }
+    }
+    if (Array.isArray(raw.allowedViewers)) {
+      allowedViewers.splice(0, allowedViewers.length, ...raw.allowedViewers);
+      for (const viewer of allowedViewers) {
+        if (Number(viewer.id) >= nextViewerId) nextViewerId = Number(viewer.id) + 1;
+      }
+    }
+    if (Array.isArray(raw.accessRequests)) {
+      accessRequests.splice(0, accessRequests.length, ...raw.accessRequests);
+      for (const request of accessRequests) {
+        if (Number(request.id) >= nextRequestId) nextRequestId = Number(request.id) + 1;
+      }
+    }
+
+    for (const [key, value] of Object.entries(raw.nextIds || {})) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) continue;
+      if (key === "track" && number > nextTrackId) nextTrackId = number;
+      if (key === "playlist" && number > nextPlaylistId) nextPlaylistId = number;
+      if (key === "request" && number > nextRequestId) nextRequestId = number;
+      if (key === "viewer" && number > nextViewerId) nextViewerId = number;
+    }
+
+    // Rebuild the share-token index from persisted users.
+    shareTokensToUserId.clear();
+    for (const user of users.values()) {
+      if (!user.share_token) user.share_token = `sona-${user.username || user.id}`;
+      if (!shareTokensToUserId.has(user.share_token)) {
+        shareTokensToUserId.set(user.share_token, user.id);
+      }
+    }
+  } catch (error) {
+    console.error("[Sona] Could not load persistent state:", error);
   }
 }
 
@@ -650,20 +729,41 @@ function savePersistedState() {
     for (const arr of userRecentTracks.values()) {
       for (const id of arr) referencedIds.add(id);
     }
+    for (const counts of userPlayCounts.values()) {
+      for (const id of counts.keys()) referencedIds.add(id);
+    }
     const savedCatalog: Array<[number, any]> = [];
     for (const id of referencedIds) {
       const tr = catalog.get(id);
       if (tr) savedCatalog.push([id, tr]);
     }
     const payload = {
+      version: 2,
+      saved_at: new Date().toISOString(),
       catalog: savedCatalog,
+      users: Array.from(users.values()),
       userLikes: Array.from(userLikes.entries()).map(([k, v]) => [k, Array.from(v)]),
-      playlists: Array.from(playlists.entries()),
       userRecentTracks: Array.from(userRecentTracks.entries()),
+      userPlayCounts: Array.from(userPlayCounts.entries()).map(([uid, counts]) => [
+        uid,
+        Array.from(counts.entries()),
+      ]),
+      playlists: Array.from(playlists.entries()),
+      allowedViewers,
+      accessRequests,
+      nextIds: {
+        track: nextTrackId,
+        playlist: nextPlaylistId,
+        request: nextRequestId,
+        viewer: nextViewerId,
+      },
     };
-    fs.writeFileSync(PERSIST_FILE, JSON.stringify(payload), "utf-8");
-  } catch {
-    // ignore write errors
+    fs.mkdirSync(path.dirname(PERSIST_FILE), { recursive: true });
+    const tempFile = `${PERSIST_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(payload), "utf-8");
+    fs.renameSync(tempFile, PERSIST_FILE);
+  } catch (error) {
+    console.error("[Sona] Could not save persistent state:", error);
   }
 }
 
@@ -717,6 +817,40 @@ function formatPlaylistSummary(pl: DbPlaylist, _currentUserId?: number) {
   };
 }
 
+function evaluateProfileAccess(owner: DbUser, viewer?: DbUser) {
+  const request = viewer
+    ? accessRequests.find((item) => item.ownerId === owner.id && item.requesterId === viewer.id)
+    : undefined;
+  const allowedUsernames = allowedViewers
+    .filter((item) => item.ownerId === owner.id)
+    .map((item) => item.identifier_value);
+  const access = checkProfileAccess({
+    ownerId: owner.id,
+    privacy: owner.privacy,
+    viewerId: viewer?.id,
+    viewerUsername: viewer?.username,
+    allowedViewerUsernames: allowedUsernames,
+    isApprovedRequest: request?.status === "approved",
+  });
+  return { ...access, request };
+}
+
+function canViewPlaylist(pl: DbPlaylist, viewer?: DbUser) {
+  const owner = users.get(pl.userId);
+  if (!owner) return { allowed: false as const, owner: undefined, access: null };
+  if (viewer?.id === owner.id) {
+    return { allowed: true as const, owner, access: { canAccess: true, reason: "owner" as const } };
+  }
+  if (!pl.is_public) {
+    return { allowed: false as const, owner, access: null };
+  }
+  if (owner.privacy === "public") {
+    return { allowed: true as const, owner, access: { canAccess: true, reason: "public" as const } };
+  }
+  const access = evaluateProfileAccess(owner, viewer);
+  return { allowed: access.canAccess as boolean, owner, access };
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: "10mb" }));
@@ -726,16 +860,114 @@ async function startServer() {
   const staticPath = path.resolve(process.cwd(), "public/static");
   app.use("/static", express.static(staticPath));
 
-  // Auth Middleware
-  function authenticate(req: Request, _res: Response, next: () => void) {
+  const allowDevAuth =
+    process.env.ALLOW_DEV_AUTH === "true" ||
+    (!isProd && process.env.ALLOW_DEV_AUTH !== "false");
+  const sessionSecret =
+    process.env.SESSION_SECRET ||
+    process.env.TELEGRAM_BOT_TOKEN ||
+    "sona-dev-session-secret";
+  if (isProd && !process.env.SESSION_SECRET && !process.env.TELEGRAM_BOT_TOKEN) {
+    console.warn("[Sona] SESSION_SECRET/TELEGRAM_BOT_TOKEN is not set; session tokens use a development secret.");
+  }
+
+  function signSessionToken(userId: number): string {
+    const payload = Buffer.from(
+      JSON.stringify({ uid: userId, exp: Date.now() + 1000 * 60 * 60 * 24 * 30 }),
+    ).toString("base64url");
+    const signature = crypto
+      .createHmac("sha256", sessionSecret)
+      .update(payload)
+      .digest("base64url");
+    return `${payload}.${signature}`;
+  }
+
+  function resolveSessionToken(token: string): DbUser | undefined {
+    const legacyUserId = tokensToUserId.get(token);
+    if (legacyUserId) return users.get(legacyUserId);
+
+    const [payload, signature] = String(token || "").split(".");
+    if (!payload || !signature) return undefined;
+    const expected = crypto
+      .createHmac("sha256", sessionSecret)
+      .update(payload)
+      .digest("base64url");
+    const expectedBuffer = Buffer.from(expected);
+    const signatureBuffer = Buffer.from(signature);
+    if (
+      expectedBuffer.length !== signatureBuffer.length ||
+      !crypto.timingSafeEqual(expectedBuffer, signatureBuffer)
+    ) {
+      return undefined;
+    }
+    try {
+      const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+      if (!data?.uid || (data.exp && Number(data.exp) < Date.now())) return undefined;
+      return users.get(Number(data.uid));
+    } catch {
+      return undefined;
+    }
+  }
+
+  function validateTelegramInitData(initDataRaw: string): any | null {
+    const botToken = process.env.TELEGRAM_BOT_TOKEN || "";
+    if (!botToken || !initDataRaw) return null;
+    try {
+      const params = new URLSearchParams(initDataRaw);
+      const hash = params.get("hash");
+      if (!hash) return null;
+      params.delete("hash");
+      const dataCheckString = Array.from(params.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, value]) => `${key}=${value}`)
+        .join("\n");
+      const secret = crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
+      const computed = crypto
+        .createHmac("sha256", secret)
+        .update(dataCheckString)
+        .digest("hex");
+      const hashBuffer = Buffer.from(hash, "hex");
+      const computedBuffer = Buffer.from(computed, "hex");
+      if (
+        hashBuffer.length !== computedBuffer.length ||
+        !crypto.timingSafeEqual(hashBuffer, computedBuffer)
+      ) {
+        return null;
+      }
+      const authDate = Number(params.get("auth_date") || 0);
+      if (!authDate || Math.abs(Date.now() / 1000 - authDate) > 60 * 60 * 24 * 7) {
+        return null;
+      }
+      const rawUser = params.get("user");
+      return rawUser ? JSON.parse(rawUser) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function authenticate(req: Request, res: Response, next: () => void) {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      (req as any).user = users.get(1);
+      return res.status(401).json({ detail: "Требуется авторизация" });
+    }
+    const user = resolveSessionToken(authHeader.replace("Bearer ", "").trim());
+    if (!user) {
+      return res.status(401).json({ detail: "Сессия истекла. Открой приложение заново." });
+    }
+    (req as any).user = user;
+    next();
+  }
+
+  function optionalAuthenticate(req: Request, res: Response, next: () => void) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      (req as any).user = undefined;
       return next();
     }
-    const token = authHeader.replace("Bearer ", "").trim();
-    const userId = tokensToUserId.get(token) || 1;
-    (req as any).user = users.get(userId) || users.get(1);
+    const user = resolveSessionToken(authHeader.replace("Bearer ", "").trim());
+    // Public links must keep working even if a stale token is still stored in
+    // the browser. Protected routes use authenticate() and return 401.
+    (req as any).user = user;
     next();
   }
 
@@ -748,46 +980,79 @@ async function startServer() {
       service: "Sona Music Server",
       environment: isProd ? "production" : "development",
       providers: ["SoundCloud Full", "Muzfan 320kbps", "Deezer", "Apple Music", "Audius"],
-      bot_configured: true,
+      bot_configured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
+      persistence: PERSIST_FILE,
+      auth_mode: process.env.TELEGRAM_BOT_TOKEN ? "telegram-initdata" : allowDevAuth ? "development" : "disabled",
     });
   });
 
+  function createUniqueShareToken(username: string, userId: number): string {
+    let token = "";
+    do {
+      token = `sona-${username || userId}-${crypto.randomBytes(3).toString("hex")}`;
+    } while (shareTokensToUserId.has(token));
+    return token;
+  }
+
   // Auth Bootstrap & Dev & Session
   const handleAuth = (req: Request, res: Response) => {
-    const initDataRaw = (req.body?.initData || req.body?.init_data || "") as string;
-    let telegramUser: any = req.body?.telegramUser || req.body?.telegram_user || null;
+    const initDataRaw = String(req.body?.initData || req.body?.init_data || "");
+    let telegramUser: any = null;
+    let isDev = false;
 
     if (initDataRaw) {
-      try {
-        const params = new URLSearchParams(initDataRaw);
-        const userParam = params.get("user");
-        if (userParam) telegramUser = JSON.parse(userParam);
-      } catch {
-        // ignore
+      telegramUser = validateTelegramInitData(initDataRaw);
+      if (!telegramUser) {
+        if (!allowDevAuth) {
+          return res.status(401).json({
+            detail: "Не удалось проверить подпись Telegram initData. Открой приложение через Telegram.",
+          });
+        }
+        // Local browser preview only: never trust raw initData without a
+        // configured bot token, but keep preview usable during development.
+        try {
+          const params = new URLSearchParams(initDataRaw);
+          const userParam = params.get("user");
+          if (userParam) telegramUser = JSON.parse(userParam);
+        } catch {
+          telegramUser = null;
+        }
+        isDev = true;
       }
+    }
+
+    if (!telegramUser) {
+      if (!allowDevAuth) {
+        return res.status(401).json({
+          detail: "Авторизация доступна только внутри Telegram Mini App.",
+        });
+      }
+      telegramUser = req.body?.telegramUser || req.body?.telegram_user || null;
+      isDev = true;
     }
 
     let user: DbUser;
     if (telegramUser && (telegramUser.id || telegramUser.first_name || telegramUser.username)) {
-      const tgId = Number(telegramUser.id) || 100001;
+      const tgId = Number(telegramUser.id);
+      if (!Number.isFinite(tgId) || tgId <= 0) {
+        return res.status(400).json({ detail: "Telegram не передал корректный ID пользователя." });
+      }
       const firstName = String(telegramUser.first_name || telegramUser.username || "Пользователь").trim();
       const lastName = String(telegramUser.last_name || "").trim();
       const displayName = `${firstName} ${lastName}`.trim();
       const username = String(telegramUser.username || "").replace(/^@/, "").trim();
 
-      const existing = Array.from(users.values()).find(
-        (u) => u.telegram_id === tgId || (username && u.username.toLowerCase() === username.toLowerCase())
-      );
-
+      const existing = Array.from(users.values()).find((u) => u.telegram_id === tgId);
       if (existing) {
         existing.first_name = firstName;
         existing.last_name = lastName;
         existing.display_name = displayName;
         if (username) existing.username = username;
-        if (telegramUser.photo_url) existing.photo_url = telegramUser.photo_url;
+        if (telegramUser.photo_url && isDev) existing.photo_url = telegramUser.photo_url;
         user = existing;
       } else {
-        const newId = users.size + 1;
+        const newId = Math.max(1, ...Array.from(users.keys())) + 1;
+        const shareToken = createUniqueShareToken(username, newId);
         user = {
           id: newId,
           telegram_id: tgId,
@@ -801,19 +1066,19 @@ async function startServer() {
           privacy: "public",
           show_liked: true,
           show_playlists: true,
-          share_token: `sona-${username || tgId}-${Math.floor(Math.random() * 9000 + 1000)}`,
+          share_token: shareToken,
           created_at: new Date().toISOString(),
         };
         users.set(user.id, user);
         userLikes.set(user.id, new Set());
-        shareTokensToUserId.set(user.share_token, user.id);
+        shareTokensToUserId.set(shareToken, user.id);
       }
+      savePersistedState();
     } else {
       user = users.get(1)!;
     }
 
-    const token = `token_${user.id}_${Date.now()}`;
-    tokensToUserId.set(token, user.id);
+    const token = signSessionToken(user.id);
 
     res.json({
       token,
@@ -829,7 +1094,7 @@ async function startServer() {
         accent: user.accent,
         privacy: user.privacy,
       },
-      is_dev: !isProd,
+      is_dev: isDev,
     });
   };
 
@@ -872,11 +1137,14 @@ async function startServer() {
 
   const handlePatchMe = (req: any, res: Response) => {
     const user = req.user;
-    if (req.body.first_name !== undefined) user.first_name = String(req.body.first_name).trim();
-    if (req.body.last_name !== undefined) user.last_name = String(req.body.last_name).trim();
-    if (req.body.bio !== undefined) user.bio = String(req.body.bio).trim();
-    if (req.body.accent !== undefined) user.accent = req.body.accent;
-    user.display_name = `${user.first_name} ${user.last_name || ""}`.trim();
+    if (req.body.first_name !== undefined) user.first_name = String(req.body.first_name).trim().slice(0, 64);
+    if (req.body.last_name !== undefined) user.last_name = String(req.body.last_name).trim().slice(0, 64);
+    if (req.body.bio !== undefined) user.bio = String(req.body.bio).trim().slice(0, 280);
+    if (req.body.accent !== undefined && ["lime", "coral", "sky", "lilac", "sun"].includes(req.body.accent)) {
+      user.accent = req.body.accent;
+    }
+    user.display_name = `${user.first_name} ${user.last_name || ""}`.trim() || user.username || "Пользователь";
+    savePersistedState();
     res.json({
       id: user.id,
       telegram_id: user.telegram_id,
@@ -892,6 +1160,67 @@ async function startServer() {
   };
   app.patch("/api/users/me", authenticate, handlePatchMe);
   app.patch("/api/me", authenticate, handlePatchMe);
+
+  function buildMixes(userId: number) {
+    const allTracks = Array.from(catalog.values()).filter((track) => track && !track.is_demo);
+    if (allTracks.length === 0) return [];
+
+    const likedIds = userLikes.get(userId) || new Set<number>();
+    const recentIds = userRecentTracks.get(userId) || [];
+    const likedTracks = Array.from(likedIds).map((id) => catalog.get(id)).filter(Boolean);
+    const recentTracks = recentIds.map((id) => catalog.get(id)).filter(Boolean);
+    const favoriteTags = Array.from(new Set(likedTracks.flatMap((track: any) => track.tags || [])));
+    const playCountByArtist: Record<string, number> = {};
+    for (const [trackId, count] of (userPlayCounts.get(userId) || new Map()).entries()) {
+      const track = catalog.get(trackId);
+      if (!track) continue;
+      const artist = String(track.artist || "").toLowerCase();
+      playCountByArtist[artist] = (playCountByArtist[artist] || 0) + Number(count || 0);
+    }
+    const history = {
+      likedArtists: likedTracks.map((track: any) => String(track.artist || "")),
+      playCountByArtist,
+      favoriteTags,
+    };
+    const ranked = [...allTracks].sort(
+      (a, b) =>
+        scoreTrackRecommendation(b, history) - scoreTrackRecommendation(a, history),
+    );
+    const unseen = ranked.filter((track) => !likedIds.has(track.id));
+
+    const mixes: any[] = [];
+    const pushMix = (id: string, title: string, subtitle: string, accent: string, tracks: any[]) => {
+      const unique = Array.from(new Map(tracks.filter(Boolean).map((track) => [track.id, track])).values());
+      if (unique.length === 0) return;
+      mixes.push({
+        id,
+        title,
+        subtitle,
+        accent,
+        artwork_url: unique[0]?.artwork_url || null,
+        tracks: unique.map((track) => enrichTrack(track, userId)),
+      });
+    };
+
+    pushMix(
+      "for-you",
+      "Для тебя",
+      "Подобрано по любимым артистам и истории прослушиваний",
+      "lime",
+      (unseen.length > 0 ? unseen : ranked).slice(0, 30),
+    );
+    pushMix("recent", "Недавнее", "Треки, к которым ты возвращался", "sky", recentTracks.slice(0, 30));
+    pushMix("liked", "Твои лайки", "Всё, что уже сохранено в избранном", "coral", likedTracks.slice(0, 30));
+    pushMix(
+      "discover",
+      "Открытия",
+      "Свежие треки из импортированных плейлистов",
+      "lilac",
+      [...allTracks].reverse().slice(0, 30),
+    );
+
+    return mixes;
+  }
 
   // Home Screen Data
   const handleHome = (req: any, res: Response) => {
@@ -940,7 +1269,7 @@ async function startServer() {
       liked_count: likesSet.size,
       playlists: userPlaylists,
       recent,
-      mixes: [],
+      mixes: buildMixes(user.id),
       new_releases: likedTracks.length > 0 ? likedTracks.slice(0, 6) : discovered,
       stats: {
         liked: likesSet.size,
@@ -954,8 +1283,10 @@ async function startServer() {
   app.get("/api/users/home", authenticate, handleHome);
 
   // Mix lookup
-  app.get("/api/mixes/:id", authenticate, (_req: any, res) => {
-    return res.status(404).json({ detail: "Микс не найден" });
+  app.get("/api/mixes/:id", authenticate, (req: any, res) => {
+    const mix = buildMixes(req.user.id).find((item: any) => item.id === req.params.id);
+    if (!mix) return res.status(404).json({ detail: "Микс не найден" });
+    return res.json(mix);
   });
 
   // Full-length Continuous Audio Stream Endpoint (/api/stream/:id)
@@ -1458,6 +1789,7 @@ async function startServer() {
         userPlayCounts.set(userId, counts);
       }
       counts.set(id, (counts.get(id) || 0) + 1);
+      savePersistedState();
     }
     res.json({ ok: true });
   });
@@ -1588,11 +1920,16 @@ async function startServer() {
     res.json({ ...formatPlaylistSummary(newPl, userId), tracks: [] });
   });
 
-  // Get single playlist
-  app.get("/api/playlists/:id", authenticate, (req: any, res) => {
+  // Get single playlist. Public playlists are readable without a session;
+  // private playlists and private profiles stay visible only to their owner.
+  app.get("/api/playlists/:id", optionalAuthenticate, (req: any, res) => {
     const id = parseInt(req.params.id, 10);
     const pl = playlists.get(id);
     if (!pl) return res.status(404).json({ detail: "Плейлист не найден" });
+    const visibility = canViewPlaylist(pl, req.user);
+    if (!visibility.allowed) {
+      return res.status(404).json({ detail: "Плейлист не найден" });
+    }
 
     const summary = formatPlaylistSummary(pl, req.user?.id);
     const tracks = pl.trackIds
@@ -1647,6 +1984,9 @@ async function startServer() {
     const id = parseInt(req.params.id, 10);
     const pl = playlists.get(id);
     if (!pl) return res.status(404).json({ detail: "Плейлист не найден" });
+    if (pl.userId !== req.user?.id) {
+      return res.status(403).json({ detail: "Нет доступа к редактированию плейлиста" });
+    }
     const trackId = parseInt(req.body.track_id, 10);
     const bodyTrack = req.body?.track;
     if (!catalog.has(trackId) && bodyTrack && bodyTrack.title) {
@@ -1681,6 +2021,9 @@ async function startServer() {
     const id = parseInt(req.params.id, 10);
     const pl = playlists.get(id);
     if (!pl) return res.status(404).json({ detail: "Плейлист не найден" });
+    if (pl.userId !== req.user?.id) {
+      return res.status(403).json({ detail: "Нет доступа к редактированию плейлиста" });
+    }
     const trackId = parseInt(req.params.trackId, 10);
 
     pl.trackIds = pl.trackIds.filter((tid) => tid !== trackId);
@@ -1700,6 +2043,9 @@ async function startServer() {
     const id = parseInt(req.params.id, 10);
     const pl = playlists.get(id);
     if (!pl) return res.status(404).json({ detail: "Плейлист не найден" });
+    if (pl.userId !== req.user?.id) {
+      return res.status(403).json({ detail: "Нет доступа к редактированию плейлиста" });
+    }
     if (Array.isArray(req.body.track_ids)) {
       pl.trackIds = req.body.track_ids;
       pl.updated_at = new Date().toISOString();
@@ -1796,14 +2142,18 @@ async function startServer() {
 
   app.patch("/api/settings", authenticate, (req: any, res) => {
     const user: DbUser = req.user;
-    if (req.body.privacy) user.privacy = req.body.privacy;
+    if (["public", "selected", "private"].includes(req.body.privacy)) {
+      user.privacy = req.body.privacy;
+    }
     if (req.body.show_liked !== undefined) user.show_liked = Boolean(req.body.show_liked);
     if (req.body.show_playlists !== undefined) user.show_playlists = Boolean(req.body.show_playlists);
-    if (req.body.accent) user.accent = req.body.accent;
-    if (req.body.bio !== undefined) user.bio = req.body.bio;
+    if (["lime", "coral", "sky", "lilac", "sun"].includes(req.body.accent)) {
+      user.accent = req.body.accent;
+    }
+    if (req.body.bio !== undefined) user.bio = String(req.body.bio).trim().slice(0, 280);
     if (req.body.first_name !== undefined) {
-      user.first_name = req.body.first_name;
-      user.display_name = `${user.first_name} ${user.last_name || ""}`.trim();
+      user.first_name = String(req.body.first_name).trim().slice(0, 64);
+      user.display_name = `${user.first_name} ${user.last_name || ""}`.trim() || user.username;
     }
     savePersistedState();
 
@@ -1854,7 +2204,7 @@ async function startServer() {
   const handleRotateShare = (req: any, res: Response) => {
     const user: DbUser = req.user;
     shareTokensToUserId.delete(user.share_token);
-    user.share_token = `sona-${user.username || user.id}-${Math.floor(Math.random() * 90000 + 10000)}`;
+    user.share_token = createUniqueShareToken(user.username, user.id);
     shareTokensToUserId.set(user.share_token, user.id);
     savePersistedState();
     return handleGetSettings(req, res);
@@ -1880,7 +2230,7 @@ async function startServer() {
   };
 
   // Public Profile lookup by token
-  app.get("/api/share/:token", authenticate, (req: any, res) => {
+  app.get("/api/share/:token", optionalAuthenticate, (req: any, res) => {
     const token = req.params.token;
     const owner = findUserByShareToken(token);
     if (!owner) {
@@ -1888,29 +2238,15 @@ async function startServer() {
     }
 
     const viewer: DbUser | undefined = req.user;
-
-    // Check request status
-    const reqItem = accessRequests.find(
-      (r) => r.ownerId === owner.id && r.requesterId === viewer?.id
-    );
-
-    // Evaluate access via pure musicLogic check
-    const allowedUsernames = allowedViewers
-      .filter((v) => v.ownerId === owner.id)
-      .map((v) => v.identifier_value);
-
-    const access = checkProfileAccess({
-      ownerId: owner.id,
-      privacy: owner.privacy,
-      viewerId: viewer?.id,
-      viewerUsername: viewer?.username,
-      allowedViewerUsernames: allowedUsernames,
-      isApprovedRequest: reqItem?.status === "approved",
-    });
-
+    const access = evaluateProfileAccess(owner, viewer);
+    const reqItem = access.request;
     const isOwner = viewer?.id === owner.id;
     const canView = access.canAccess;
-    const canRequest = !canView && owner.privacy === "selected" && (!reqItem || reqItem.status === "declined");
+    const canRequest =
+      !canView &&
+      owner.privacy === "selected" &&
+      Boolean(viewer) &&
+      (!reqItem || reqItem.status === "declined");
 
     const ownerLikes = userLikes.get(owner.id) || new Set();
     const likedTracks = canView && owner.show_liked
@@ -1926,6 +2262,12 @@ async function startServer() {
           .map((p) => formatPlaylistSummary(p, viewer?.id))
       : [];
 
+    const visibleTrackIds = new Set<number>([
+      ...(canView && owner.show_liked ? Array.from(ownerLikes) : []),
+      ...ownerPlaylists.flatMap((playlist) => playlists.get(playlist.id)?.trackIds || []),
+      ...(canView ? userRecentTracks.get(owner.id) || [] : []),
+    ]);
+
     res.json({
       user: {
         id: owner.id,
@@ -1938,18 +2280,26 @@ async function startServer() {
         accent: owner.accent,
         is_demo: false,
       },
-      access: access.reason === "owner" ? "owner" : canView ? "public" : access.reason === "private" ? "private" : "locked",
+      access: isOwner
+        ? "owner"
+        : canView
+          ? owner.privacy === "public"
+            ? "public"
+            : "granted"
+          : owner.privacy === "private"
+            ? "private"
+            : "locked",
       can_view: canView,
       can_request: canRequest,
       request_status: reqItem?.status || null,
       stats: {
-        liked: ownerLikes.size,
-        playlists: ownerPlaylists.length,
-        tracks: Array.from(userPlayCounts.get(owner.id)?.values() || []).reduce((a, b) => a + b, 0),
+        liked: canView && owner.show_liked ? ownerLikes.size : 0,
+        playlists: canView && owner.show_playlists ? ownerPlaylists.length : 0,
+        tracks: canView ? visibleTrackIds.size : 0,
       },
       playlists: ownerPlaylists,
       liked_tracks: likedTracks,
-      show_liked: owner.show_liked,
+      show_liked: canView ? owner.show_liked : false,
       share_token: owner.share_token,
       is_authenticated: Boolean(viewer),
     });
@@ -1961,6 +2311,12 @@ async function startServer() {
     const owner = findUserByShareToken(token);
     if (!owner) return res.status(404).json({ detail: "Профиль не найден" });
     const viewer: DbUser = req.user;
+    if (viewer.id === owner.id) {
+      return res.status(400).json({ detail: "Это твой собственный профиль" });
+    }
+    if (owner.privacy !== "selected") {
+      return res.status(400).json({ detail: "Этот профиль не принимает запросы на доступ" });
+    }
 
     const existing = accessRequests.find(
       (r) => r.ownerId === owner.id && r.requesterId === viewer.id
@@ -1987,14 +2343,21 @@ async function startServer() {
   app.post("/api/share/:token/request", authenticate, handleRequestAccess);
 
   // Public playlist lookup
-  app.get("/api/share/:token/playlists/:id", authenticate, (req: any, res) => {
+  app.get("/api/share/:token/playlists/:id", optionalAuthenticate, (req: any, res) => {
     const token = req.params.token;
     const owner = findUserByShareToken(token);
+    if (!owner) return res.status(404).json({ detail: "Профиль не найден" });
     const plId = parseInt(req.params.id, 10);
     const pl = playlists.get(plId);
 
-    if (!pl || (owner && pl.userId !== owner.id)) {
+    if (!pl || pl.userId !== owner.id) {
       return res.status(404).json({ detail: "Плейлист не найден" });
+    }
+
+    const access = evaluateProfileAccess(owner, req.user);
+    const isOwner = req.user?.id === owner.id;
+    if (!access.canAccess || (!isOwner && (!owner.show_playlists || !pl.is_public))) {
+      return res.status(404).json({ detail: "Плейлист не найден или скрыт владельцем" });
     }
 
     const summary = formatPlaylistSummary(pl, req.user?.id);
@@ -2005,26 +2368,35 @@ async function startServer() {
 
     res.json({
       playlist: { ...summary, tracks },
-      access: "public",
-      can_copy: true,
+      access: isOwner ? "owner" : access.reason === "public" ? "public" : "granted",
+      can_copy: access.canAccess,
     });
   });
 
   // Copy public playlist to user's library
   app.post("/api/share/:token/playlists/:id/copy", authenticate, (req: any, res) => {
+    const owner = findUserByShareToken(req.params.token);
+    if (!owner) return res.status(404).json({ detail: "Профиль не найден" });
     const plId = parseInt(req.params.id, 10);
     const pl = playlists.get(plId);
-    if (!pl) return res.status(404).json({ detail: "Плейлист не найден" });
+    if (!pl || pl.userId !== owner.id) {
+      return res.status(404).json({ detail: "Плейлист не найден" });
+    }
+    const access = evaluateProfileAccess(owner, req.user);
+    const isOwner = req.user?.id === owner.id;
+    if (!access.canAccess || (!isOwner && (!owner.show_playlists || !pl.is_public))) {
+      return res.status(403).json({ detail: "Нет доступа к этому плейлисту" });
+    }
 
     const user: DbUser = req.user;
     const copyPl: DbPlaylist = {
       id: nextPlaylistId++,
       userId: user.id,
       title: `${pl.title} (Копия)`,
-      description: `Скопировано из профиля ${users.get(pl.userId)?.display_name || ""}`,
+      description: `Скопировано из профиля ${owner.display_name || ""}`,
       cover_url: pl.cover_url,
       is_public: true,
-      trackIds: [...pl.trackIds],
+      trackIds: Array.from(new Set(pl.trackIds)),
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
@@ -2036,177 +2408,180 @@ async function startServer() {
     });
   });
 
-  // Helper: resolve a list of { artist, title } pairs into catalog track IDs in parallel
-  async function resolveTrackPairsToCatalog(
-    items: Array<{ artist: string; title: string; durationMs?: number; artworkUrl?: string | null }>,
-    providerLabel: string,
-    defaultAlbum: string
-  ): Promise<number[]> {
-    const slice = items.slice(0, 20);
-    const resolved = await Promise.all(
-      slice.map(async (item): Promise<number | null> => {
-        const q = item.artist ? `${item.artist} ${item.title}` : item.title;
-        if (!q.trim()) return null;
-
-        let matched = Array.from(catalog.values()).find(
-          (t) =>
-            normalizeSearchTokens(t.title) === normalizeSearchTokens(item.title) &&
-            (!item.artist || normalizeSearchTokens(t.artist).includes(normalizeSearchTokens(item.artist)))
-        );
-
-        if (!matched) {
-          try {
-            const deezerRes = await fetch(
-              `https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=1`,
-              { signal: AbortSignal.timeout(2500) }
-            );
-            const deezerData = await deezerRes.json();
-            if (deezerData?.data?.[0]) {
-              const hit = deezerData.data[0];
-              const trackId = nextTrackId++;
-              matched = {
-                id: trackId,
-                title: hit.title || item.title,
-                artist: hit.artist?.name || item.artist || "Исполнитель",
-                album: hit.album?.title || defaultAlbum,
-                duration_ms: Math.max(90, hit.duration || 195) * 1000,
-                artwork_url: hit.album?.cover_big || hit.album?.cover_medium || item.artworkUrl || null,
-                preview_url: `/api/stream/${trackId}`,
-                external_url: hit.link || null,
-                provider: providerLabel,
-                links: { deezer: hit.link || "https://www.deezer.com" },
-                sources: [defaultAlbum, "Full Track"],
-                is_demo: false,
-                liked: false,
-              };
-              catalog.set(trackId, matched);
-            }
-          } catch {
-            // fallback below
-          }
-        }
-
-        if (!matched) {
-          try {
-            const itunesRes = await fetch(
-              `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&entity=song&limit=1`,
-              { signal: AbortSignal.timeout(2500) }
-            );
-            const itunesData = await itunesRes.json();
-            if (itunesData?.results?.[0]) {
-              const hit = itunesData.results[0];
-              const trackId = nextTrackId++;
-              matched = {
-                id: trackId,
-                title: hit.trackName || item.title,
-                artist: hit.artistName || item.artist || "Исполнитель",
-                album: hit.collectionName || defaultAlbum,
-                duration_ms: Math.max(90000, hit.trackTimeMillis || item.durationMs || 195000),
-                artwork_url: hit.artworkUrl100
-                  ? hit.artworkUrl100.replace("100x100bb", "600x600bb")
-                  : item.artworkUrl || null,
-                preview_url: `/api/stream/${trackId}`,
-                external_url: hit.trackViewUrl || null,
-                provider: providerLabel,
-                links: { itunes: hit.trackViewUrl || "https://music.apple.com" },
-                sources: [defaultAlbum, "Full Track"],
-                is_demo: false,
-                liked: false,
-              };
-              catalog.set(trackId, matched);
-            }
-          } catch {
-            // fallback below
-          }
-        }
-
-        if (!matched) {
-          const trackId = nextTrackId++;
-          matched = {
-            id: trackId,
-            title: item.title,
-            artist: item.artist || "Исполнитель",
-            album: defaultAlbum,
-            duration_ms: item.durationMs || 205000,
-            artwork_url: item.artworkUrl || null,
-            preview_url: `/api/stream/${trackId}`,
-            external_url: null,
-            provider: providerLabel,
-            links: {},
-            sources: [defaultAlbum, "Full Track"],
-            is_demo: false,
-            liked: false,
-          };
-          catalog.set(trackId, matched);
-        }
-
-        return matched.id;
-      })
-    );
-
-    return Array.from(new Set(resolved.filter((id): id is number => typeof id === "number")));
+  function importArtistWords(value: string): string[] {
+    return normalizeSearchTokens(value)
+      .replace(/\b(feat|ft|featuring)\b.*$/, "")
+      .split(" ")
+      .filter((word) => word.length >= 2);
   }
 
-  // Helper: fetch tracks from Deezer search/chart query and register in catalog
-  async function resolveTracksByQuery(query: string, providerLabel: string, defaultAlbum: string, limit = 15): Promise<number[]> {
+  function isStrictTitleMatch(left: string, right: string): boolean {
+    const a = normalizeSearchTokens(left);
+    const b = normalizeSearchTokens(right);
+    if (!a || !b) return false;
+    if (a === b) return true;
+    // Allow a version suffix ("Blinding Lights" vs "Blinding Lights (Live)")
+    // only when both titles are long enough to avoid one-word collisions.
+    return a.length >= 8 && b.length >= 8 && (a.includes(b) || b.includes(a));
+  }
+
+  function isStrictArtistMatch(left: string, right: string): boolean {
+    const a = importArtistWords(left);
+    const b = importArtistWords(right);
+    if (a.length === 0 || b.length === 0) return false;
+    const overlap = a.filter((word) => b.includes(word)).length;
+    return overlap / Math.min(a.length, b.length) >= 0.5;
+  }
+
+  function isDurationMatch(expectedMs?: number, actualMs?: number): boolean {
+    if (!expectedMs || !actualMs) return true;
+    return Math.abs(Number(expectedMs) - Number(actualMs)) <= 10_000;
+  }
+
+  function findCatalogTrackForImport(item: ImportedTrackMetadata): any | undefined {
+    for (const track of catalog.values()) {
+      if (!track || track.is_demo || !track.title || !track.artist) continue;
+      if (!isStrictTitleMatch(track.title, item.title)) continue;
+      if (item.artist && !isStrictArtistMatch(track.artist, item.artist)) continue;
+      if (!isDurationMatch(item.durationMs, track.duration_ms)) continue;
+      return track;
+    }
+    return undefined;
+  }
+
+  function registerImportedTracks(
+    items: ImportedTrackMetadata[],
+    providerLabel: string,
+    defaultAlbum: string,
+  ): number[] {
     const ids: number[] = [];
-    try {
-      const dzRes = await fetch(
-        query.trim()
-          ? `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=${limit}`
-          : `https://api.deezer.com/chart/0/tracks?limit=${limit}`,
-        { signal: AbortSignal.timeout(3500) }
-      );
-      const dzData = await dzRes.json();
-      const list = Array.isArray(dzData?.data) ? dzData.data : [];
-      for (const hit of list) {
-        if (!hit?.title) continue;
-        const existing = Array.from(catalog.values()).find(
-          (t) =>
-            normalizeSearchTokens(t.title) === normalizeSearchTokens(hit.title) &&
-            normalizeSearchTokens(t.artist) === normalizeSearchTokens(hit.artist?.name || "")
-        );
-        if (existing) {
-          if (!ids.includes(existing.id)) ids.push(existing.id);
-          continue;
+    for (const item of items) {
+      const title = String(item.title || "").trim();
+      if (!title) continue;
+      const artist = String(item.artist || "").trim() || "Исполнитель";
+      const existing = findCatalogTrackForImport({ ...item, title, artist });
+      if (existing) {
+        if (item.album && !existing.album) existing.album = item.album;
+        if (item.artworkUrl && !existing.artwork_url) existing.artwork_url = item.artworkUrl;
+        if (item.externalUrl && !existing.external_url) existing.external_url = item.externalUrl;
+        if (item.streamUrl && !existing.full_stream_url) existing.full_stream_url = item.streamUrl;
+        if (item.durationMs && (!existing.duration_ms || existing.duration_ms < 1_000)) {
+          existing.duration_ms = item.durationMs;
         }
-        const trackId = nextTrackId++;
-        catalog.set(trackId, {
-          id: trackId,
-          title: hit.title,
-          artist: hit.artist?.name || "Исполнитель",
-          album: hit.album?.title || defaultAlbum,
-          duration_ms: Math.max(90, hit.duration || 195) * 1000,
-          artwork_url: hit.album?.cover_big || hit.album?.cover_medium || null,
-          preview_url: `/api/stream/${trackId}`,
-          external_url: hit.link || null,
-          provider: providerLabel,
-          links: { deezer: hit.link || "https://www.deezer.com" },
-          sources: [defaultAlbum, "Full Track"],
-          is_demo: false,
-          liked: false,
-        });
-        ids.push(trackId);
+        existing.links = { ...(existing.links || {}), ...(item.sourceLinks || {}) };
+        if (!ids.includes(existing.id)) ids.push(existing.id);
+        continue;
+      }
+
+      const trackId = nextTrackId++;
+      const track = {
+        id: trackId,
+        title,
+        artist,
+        album: item.album || defaultAlbum,
+        duration_ms: item.durationMs || 0,
+        artwork_url: item.artworkUrl || null,
+        preview_url: `/api/stream/${trackId}`,
+        full_stream_url: item.streamUrl || null,
+        external_url: item.externalUrl || null,
+        provider: item.provider || providerLabel,
+        links: item.sourceLinks || {},
+        sources: [providerLabel, item.streamUrl ? "Direct Stream" : "Full Track"],
+        is_demo: false,
+        liked: false,
+        imported_from: providerLabel,
+      };
+      catalog.set(trackId, track);
+      ids.push(trackId);
+    }
+    return Array.from(new Set(ids));
+  }
+
+  async function findStrictDeezerMetadata(
+    item: ImportedTrackMetadata,
+  ): Promise<Partial<ImportedTrackMetadata> | null> {
+    const query = `${item.artist || ""} ${item.title || ""}`.trim();
+    if (!query) return null;
+    try {
+      const response = await fetch(
+        `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=10`,
+        { signal: AbortSignal.timeout(3_500) },
+      );
+      const data = await response.json();
+      const hits = Array.isArray(data?.data) ? data.data : [];
+      for (const hit of hits) {
+        if (!hit?.title) continue;
+        if (!isStrictTitleMatch(item.title, hit.title)) continue;
+        if (item.artist && !isStrictArtistMatch(item.artist, hit.artist?.name || "")) continue;
+        if (!isDurationMatch(item.durationMs, Number(hit.duration || 0) * 1000)) continue;
+        return {
+          album: hit.album?.title || item.album || null,
+          durationMs: item.durationMs || Number(hit.duration || 0) * 1000 || undefined,
+          artworkUrl:
+            hit.album?.cover_big ||
+            hit.album?.cover_medium ||
+            hit.album?.cover_small ||
+            item.artworkUrl ||
+            null,
+          externalUrl: hit.link || item.externalUrl || null,
+          sourceLinks: { deezer: hit.link || "https://www.deezer.com" },
+        };
       }
     } catch {
-      // fallback to SoundCloud full track search
+      // Metadata enrichment is optional. The original import still succeeds.
     }
+    return null;
+  }
 
-    if (ids.length === 0) {
-      const scTracks = await searchSoundCloudFullTracks(query || "top hits 2025", limit);
-      for (const st of scTracks) {
-        catalog.set(st.id, st);
-        ids.push(st.id);
+  async function resolveTrackPairsToCatalog(
+    items: Array<{
+      artist: string;
+      title: string;
+      durationMs?: number;
+      artworkUrl?: string | null;
+      album?: string | null;
+    }>,
+    providerLabel: string,
+    defaultAlbum: string,
+  ): Promise<number[]> {
+    const slice = items.slice(0, 100);
+    const results: Array<number | null> = new Array(slice.length).fill(null);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < slice.length) {
+        const index = cursor++;
+        const item = slice[index];
+        if (!String(item.title || "").trim()) continue;
+        const metadata = await findStrictDeezerMetadata(item);
+        const resolved = registerImportedTracks(
+          [
+            {
+              artist: item.artist,
+              title: item.title,
+              album: item.album || defaultAlbum,
+              durationMs: item.durationMs,
+              artworkUrl: item.artworkUrl,
+              ...metadata,
+            },
+          ],
+          providerLabel,
+          defaultAlbum,
+        );
+        results[index] = resolved[0] || null;
       }
-    }
-    return ids;
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(5, Math.max(1, slice.length)) }, () => worker()),
+    );
+    return Array.from(new Set(results.filter((id): id is number => typeof id === "number")));
   }
 
   // Universal URL Import Resolver (Sona, Yandex Music, VK Music, SoundCloud, Deezer, Spotify)
   async function importByUrlInternal(
     rawInput: string,
     customPlaylistTitle: string | undefined,
-    user: DbUser
+    user: DbUser,
+    providerToken?: string,
   ): Promise<{ playlist: DbPlaylist; sourceName: string }> {
     const desc = parseImportUrl(rawInput);
     if (!desc) {
@@ -2224,7 +2599,12 @@ async function startServer() {
       sourceName = "Sona";
       if (desc.playlistId) {
         const pl = playlists.get(Number(desc.playlistId));
-        if (pl && pl.trackIds.length > 0) {
+        if (!pl) throw new Error("Плейлист Sona не найден.");
+        const visibility = canViewPlaylist(pl, user);
+        if (!visibility.allowed) {
+          throw new Error("Плейлист Sona скрыт владельцем или доступен только по прямой share-ссылке профиля.");
+        }
+        if (pl.trackIds.length > 0) {
           resolvedTitle = resolvedTitle || `${pl.title} (Импорт)`;
           resolvedDescription = `Импортировано из плейлиста Sona «${pl.title}»`;
           resolvedCover = pl.cover_url || null;
@@ -2234,19 +2614,32 @@ async function startServer() {
       if (resolvedTrackIds.length === 0 && desc.token) {
         const owner = findUserByShareToken(desc.token);
         if (owner) {
+          const access = evaluateProfileAccess(owner, user);
+          if (!access.canAccess) {
+            throw new Error("Владелец профиля Sona ограничил доступ. Запроси доступ или попроси прямую ссылку на плейлист.");
+          }
           resolvedTitle = resolvedTitle || `Профиль: ${owner.display_name}`;
           resolvedDescription = `Импортировано из музыкального профиля ${owner.display_name} (@${owner.username || "sona"})`;
           resolvedCover = owner.photo_url || null;
-          const ownerLikes = Array.from(userLikes.get(owner.id) || []);
-          const ownerPlTracks = Array.from(playlists.values())
-            .filter((p) => p.userId === owner.id && (p.is_public || owner.id === user.id))
-            .flatMap((p) => p.trackIds);
+          const ownerLikes =
+            owner.show_liked || owner.id === user.id
+              ? Array.from(userLikes.get(owner.id) || [])
+              : [];
+          const ownerPlTracks =
+            owner.show_playlists || owner.id === user.id
+              ? Array.from(playlists.values())
+                  .filter((p) => p.userId === owner.id && (p.is_public || owner.id === user.id))
+                  .flatMap((p) => p.trackIds)
+              : [];
           resolvedTrackIds = Array.from(new Set([...ownerLikes, ...ownerPlTracks])).filter((id) => catalog.has(id));
         }
       }
       if (resolvedTrackIds.length === 0) {
-        resolvedTitle = resolvedTitle || (desc.kind === "profile" ? `Профиль Sona (${desc.token || "Импорт"})` : "Плейлист Sona");
-        resolvedTrackIds = await resolveTracksByQuery("", "sona_import", "Sona Импорт", 12);
+        throw new Error(
+          desc.kind === "profile"
+            ? "В этом профиле Sona нет доступных треков или он закрыт настройками приватности."
+            : "Плейлист Sona не найден или пуст. Проверь ссылку.",
+        );
       }
     }
 
@@ -2347,8 +2740,7 @@ async function startServer() {
         // fallback below
       }
       if (resolvedTrackIds.length === 0) {
-        resolvedTitle = resolvedTitle || "Импорт из Deezer";
-        resolvedTrackIds = await resolveTracksByQuery("", "deezer_import", "Deezer", 15);
+        throw new Error("Deezer не вернул треки. Проверь, что ссылка публичная и плейлист не пуст.");
       }
     }
 
@@ -2458,8 +2850,7 @@ async function startServer() {
         // fallback below
       }
       if (resolvedTrackIds.length === 0) {
-        resolvedTitle = resolvedTitle || `SoundCloud: ${desc.owner || "Подборка"}`;
-        resolvedTrackIds = await resolveTracksByQuery(desc.queryHint || desc.owner || "electronic", "soundcloud", "SoundCloud", 15);
+        throw new Error("SoundCloud не вернул треки. Проверь ссылку и доступность плейлиста.");
       }
     }
 
@@ -2497,128 +2888,42 @@ async function startServer() {
         // fallback below
       }
       if (resolvedTrackIds.length === 0) {
-        resolvedTitle = resolvedTitle || "Импорт из Spotify";
-        resolvedTrackIds = await resolveTracksByQuery("", "spotify_import", "Spotify", 15);
+        throw new Error("Spotify не вернул список треков. Проверь, что ссылка публичная и плейлист не пуст.");
       }
     }
 
     // 5. Yandex Music Playlist / Album / Artist / Profile
     else if (desc.provider === "yandex") {
       sourceName = "Яндекс.Музыка";
-      try {
-        if (desc.kind === "playlist" && desc.owner && desc.playlistId) {
-          const ymRes = await fetch(
-            `https://music.yandex.ru/handlers/playlist.jsx?owner=${encodeURIComponent(desc.owner)}&kinds=${encodeURIComponent(desc.playlistId)}&light=false`,
-            {
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                Accept: "application/json",
-                "X-Retpath-Y": "https://music.yandex.ru/",
-              },
-              signal: AbortSignal.timeout(2500),
-            }
-          );
-          if (ymRes.ok) {
-            const ymData = await ymRes.json();
-            const pl = ymData?.playlist;
-            if (pl) {
-              resolvedTitle = resolvedTitle || pl.title || `Яндекс.Музыка · ${desc.owner}`;
-              const tracksRaw: any[] = Array.isArray(pl.tracks) ? pl.tracks.slice(0, 15) : [];
-              const pairs = tracksRaw
-                .filter((t) => t && t.title)
-                .map((t) => ({
-                  artist: Array.isArray(t.artists) ? t.artists.map((a: any) => a.name).join(", ") : "",
-                  title: String(t.title),
-                  durationMs: t.durationMs,
-                }));
-              if (pairs.length > 0) {
-                resolvedTrackIds = await resolveTrackPairsToCatalog(pairs, "yandex_import", resolvedTitle);
-              }
-            }
-          }
-        } else if (desc.kind === "album" && desc.playlistId) {
-          const ymRes = await fetch(
-            `https://music.yandex.ru/handlers/album.jsx?album=${encodeURIComponent(desc.playlistId)}`,
-            {
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                Accept: "application/json",
-                "X-Retpath-Y": "https://music.yandex.ru/",
-              },
-              signal: AbortSignal.timeout(2500),
-            }
-          );
-          if (ymRes.ok) {
-            const ymData = await ymRes.json();
-            if (ymData?.title) {
-              resolvedTitle = resolvedTitle || ymData.title;
-              const volumes: any[] = Array.isArray(ymData.volumes) ? ymData.volumes.flat() : [];
-              const pairs = volumes.slice(0, 15).map((t: any) => ({
-                artist: Array.isArray(t.artists) ? t.artists.map((a: any) => a.name).join(", ") : "",
-                title: String(t.title || ""),
-                durationMs: t.durationMs,
-              }));
-              if (pairs.length > 0) {
-                resolvedTrackIds = await resolveTrackPairsToCatalog(pairs, "yandex_import", resolvedTitle);
-              }
-            }
-          }
-        }
-      } catch {
-        // fallback below
-      }
-
-      if (resolvedTrackIds.length === 0) {
-        const hint = desc.queryHint && !/^(yamusic|uid-|user)/i.test(desc.queryHint) ? desc.queryHint : "";
-        resolvedTitle =
-          resolvedTitle ||
-          (desc.kind === "profile"
-            ? `Яндекс.Музыка · Профиль ${desc.owner || ""}`.trim()
-            : `Яндекс.Музыка · Плейлист ${desc.owner ? `(${desc.owner})` : ""}`.trim());
-        resolvedTrackIds = await resolveTracksByQuery(hint, "yandex_import", "Яндекс.Музыка", 15);
-      }
+      const yandexToken = String(providerToken || process.env.YANDEX_MUSIC_TOKEN || "").trim();
+      const source = await fetchYandexSource(desc, yandexToken || undefined);
+      resolvedTitle = resolvedTitle || source.title;
+      resolvedDescription = source.description;
+      resolvedCover = source.coverUrl;
+      resolvedTrackIds = registerImportedTracks(source.tracks, source.providerKey, source.title);
     }
 
     // 6. VK Music Playlist / Audio Profile / Artist
     else if (desc.provider === "vk") {
       sourceName = "VK Музыка";
-      try {
-        const vkRes = await fetch(desc.url, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "ru-RU,ru;q=0.9",
-          },
-          signal: AbortSignal.timeout(2500),
-        });
-        if (vkRes.ok) {
-          const html = await vkRes.text();
-          const ogTitle = /<meta\s+property="og:title"\s+content="([^"]+)"/i.exec(html)?.[1];
-          if (ogTitle && !/error|ошибка|вход|login|bad browser/i.test(ogTitle)) {
-            resolvedTitle = resolvedTitle || decodeHtmlEntities(ogTitle);
-          }
-        }
-      } catch {
-        // fallback below
-      }
-
-      if (resolvedTrackIds.length === 0) {
-        const hint = desc.queryHint || "";
-        resolvedTitle =
-          resolvedTitle ||
-          (desc.kind === "profile"
-            ? `VK Музыка · Профиль ${desc.owner || ""}`.trim()
-            : desc.kind === "artist"
-              ? `VK Музыка · ${desc.owner || "Артист"}`
-              : "Импорт плейлиста VK Музыки");
-        resolvedTrackIds = await resolveTracksByQuery(hint, "vk_import", "VK Музыка", 15);
-      }
+      const vkToken = String(providerToken || process.env.VK_ACCESS_TOKEN || "").trim();
+      const source = await fetchVkSource(desc, vkToken || undefined);
+      resolvedTitle = resolvedTitle || source.title;
+      resolvedDescription = source.description;
+      resolvedCover = source.coverUrl;
+      resolvedTrackIds = registerImportedTracks(source.tracks, source.providerKey, source.title);
     }
 
-    // 7. Generic URL fallback
+    // 7. Unknown URL
     else {
-      sourceName = "Веб-ссылка";
-      resolvedTitle = resolvedTitle || "Импорт по ссылке";
-      resolvedTrackIds = await resolveTracksByQuery(desc.queryHint || "", "url_import", "Импорт по ссылке", 15);
+      throw new Error(
+        "Не удалось определить музыкальный источник. Поддерживаются ссылки Sona, Яндекс.Музыки, VK, SoundCloud, Deezer и Spotify.",
+      );
+    }
+
+    resolvedTrackIds = Array.from(new Set(resolvedTrackIds)).filter((id) => catalog.has(id));
+    if (resolvedTrackIds.length === 0) {
+      throw new Error("Источник не вернул ни одного трека. Импорт отменён, пустой плейлист не создан.");
     }
 
     const firstTrack = resolvedTrackIds.length > 0 ? catalog.get(resolvedTrackIds[0]) : undefined;
@@ -2644,13 +2949,19 @@ async function startServer() {
     const user: DbUser = req.user;
     const rawUrl = String(req.body?.url || req.body?.input_text || "").trim();
     const playlistTitle = req.body?.playlist_title ? String(req.body.playlist_title).trim() : undefined;
+    const providerToken = String(req.body?.provider_token || req.body?.access_token || "").trim();
 
     if (!rawUrl) {
       return res.status(400).json({ detail: "Вставь ссылку на плейлист или профиль" });
     }
 
     try {
-      const { playlist: newPl, sourceName } = await importByUrlInternal(rawUrl, playlistTitle, user);
+      const { playlist: newPl, sourceName } = await importByUrlInternal(
+        rawUrl,
+        playlistTitle,
+        user,
+        providerToken || undefined,
+      );
       const summary = formatPlaylistSummary(newPl, user.id);
       const tracks = newPl.trackIds
         .map((tid) => catalog.get(tid))
@@ -2674,6 +2985,12 @@ async function startServer() {
   app.post("/api/share/:token/copy-profile", authenticate, async (req: any, res) => {
     const user: DbUser = req.user;
     const token = req.params.token;
+    const owner = findUserByShareToken(token);
+    if (!owner) return res.status(404).json({ detail: "Профиль не найден" });
+    const access = evaluateProfileAccess(owner, user);
+    if (!access.canAccess || (!owner.show_playlists && owner.id !== user.id)) {
+      return res.status(403).json({ detail: "Владелец профиля скрыл плейлисты или ограничил доступ" });
+    }
     try {
       const { playlist: newPl } = await importByUrlInternal(`/u/${token}`, undefined, user);
       return res.json({
@@ -2688,6 +3005,7 @@ async function startServer() {
   app.post("/api/import/vk", authenticate, async (req: any, res) => {
     const user: DbUser = req.user;
     const { input_text, playlist_title } = req.body;
+    const providerToken = String(req.body?.provider_token || req.body?.access_token || "").trim();
 
     const maybeUrl = parseImportUrl(String(input_text || ""));
     if (maybeUrl) {
@@ -2695,7 +3013,8 @@ async function startServer() {
         const { playlist: newPl, sourceName } = await importByUrlInternal(
           String(input_text),
           playlist_title,
-          user
+          user,
+          providerToken || undefined,
         );
         const summary = formatPlaylistSummary(newPl, user.id);
         const tracks = newPl.trackIds
@@ -2723,6 +3042,9 @@ async function startServer() {
       "vk_import",
       "Импорт из VK"
     );
+    if (resolvedTrackIds.length === 0) {
+      return res.status(400).json({ detail: "Не удалось сопоставить ни один трек. Проверь строки формата «Артист - Название»." });
+    }
 
     const newPl: DbPlaylist = {
       id: nextPlaylistId++,
@@ -2752,6 +3074,7 @@ async function startServer() {
   app.post("/api/import/yandex", authenticate, async (req: any, res) => {
     const user: DbUser = req.user;
     const { input_text, playlist_title } = req.body;
+    const providerToken = String(req.body?.provider_token || req.body?.access_token || "").trim();
 
     const maybeUrl = parseImportUrl(String(input_text || ""));
     if (maybeUrl) {
@@ -2759,7 +3082,8 @@ async function startServer() {
         const { playlist: newPl, sourceName } = await importByUrlInternal(
           String(input_text),
           playlist_title,
-          user
+          user,
+          providerToken || undefined,
         );
         const summary = formatPlaylistSummary(newPl, user.id);
         const tracks = newPl.trackIds
@@ -2787,6 +3111,9 @@ async function startServer() {
       "yandex_import",
       "Яндекс Музыка"
     );
+    if (resolvedTrackIds.length === 0) {
+      return res.status(400).json({ detail: "Не удалось сопоставить ни один трек. Проверь строки формата «Артист - Название»." });
+    }
 
     const newPl: DbPlaylist = {
       id: nextPlaylistId++,
